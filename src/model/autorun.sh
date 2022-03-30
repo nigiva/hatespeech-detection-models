@@ -1,0 +1,19 @@
+#!/bin/bash
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/albert-bce.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/bert-bce.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/bertweet-bce.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/distilbert-bce.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/hatebert-bce.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-bce.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-cbfl.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-cbntrfl.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-dbfl.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-db.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-fl.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-large-bce.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-ntrfl.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-pwbce.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-pwfl.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/roberta-rfl.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/xlmroberta-bce.py
+/work2/home/ing1/corentin/hatespeech-detection-models/venv/bin/python /work2/home/ing1/corentin/hatespeech-detection-models/src/model/py/xlnet-bce.py
