@@ -5,6 +5,8 @@
 *.pdf
 *.docx
 *.h5
+*.svg
+*.pdf
 data/
 session/
 export/
