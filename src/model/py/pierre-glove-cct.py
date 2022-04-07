@@ -1,5 +1,5 @@
 # %% [markdown]
-# # RoBERTa pwFL
+# # Comptact Convolutional Transformer BCE
 
 # %% [markdown]
 # ## Variables d'environnement
@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore")
 # ## Constantes
 
 # %%
-CUSTOME_NAME = "roberta-pwfl"
+CUSTOME_NAME = "glove-cct-pwbce"
 
 # Dataset
 DATA_DIR_PATH = os.path.abspath("../../data")
@@ -130,9 +130,6 @@ for gpu_id in range(GPU_COUNT):
     gpu_name = torch.cuda.get_device_name(0)
     logger.info(f"GPU {gpu_id} : {gpu_name}")
 
-
-import os
-os.exit(1)
 # %% [markdown]
 # ## Dataset
 
@@ -143,7 +140,8 @@ logger.success("Dataset loaded !")
 # %%
 # Pour réduire le nombre d'exemple et savoir sur quel groupes d'identités
 # le modèle est entrainé, on prend un sous ensemble du jeu de données
-train_df = all_train_df[~all_train_df.white.isna()]
+#train_df = all_train_df[~all_train_df.white.isna()]
+train_df = all_train_df
 if CUSTOME_NAME.startswith("test"):
     # Si c'est juste une session pour tester le notebook
     logger.debug("Mode test is enabled. The training set has been truncated to 20 000 samples.")
@@ -160,10 +158,66 @@ train_df[LABEL_LIST] = (train_df[LABEL_LIST]>=0.5).astype(int)
 validation_df[LABEL_LIST] = (validation_df[LABEL_LIST]>=0.5).astype(int)
 
 # %%
+# For GloVe tokenizer and vocabulary
+# Get the tokenizer
+tokenizer = torchtext.data.utils.get_tokenizer('basic_english')
+max_len = 70
+logger.info(f"Tokenizer : basic_english")
+# Build vocab
+min_freq = 5
+logger.info(f"Tokenizer : {min_freq=}")
+special_tokens = ['<unk>', '<pad>']
+logger.info(f"Tokenizer : {special_tokens=}")
+
+# Create tokenized column
+train_df['tokens'] = train_df['comment_text'].apply(lambda x: tokenizer(x)[:max_len])
+logger.info(f"Tokens are stored in column of train_df")
+
+vocab = torchtext.vocab.build_vocab_from_iterator(train_df['tokens'],
+                                                  min_freq=min_freq,
+                                                  specials=special_tokens)
+logger.info(f"Vocab is built")
+
+unk_index = vocab['<unk>']
+pad_index = vocab['<pad>']
+vocab.set_default_index(unk_index)
+
+# %%                                                                                                                                                                                                                        
+# Apply some negative downsampling                                                                                                                                                                                          
+# Maybe change to cleaner implem                                                                                                                                                                                            
+train_df_0 = train_df[(train_df['toxicity'] == 0) &
+                      (train_df['obscene'] == 0) &
+                      (train_df['identity_attack'] == 0) &
+                      (train_df['insult'] == 0) &
+                      (train_df['threat'] == 0) &
+                      (train_df['sexual_explicit'] == 0)]
+
+train_df_1 = train_df[(train_df['toxicity'] == 1) |
+                      (train_df['obscene'] == 1) |
+                      (train_df['identity_attack'] == 1) |
+                      (train_df['insult'] == 1) |
+                      (train_df['threat'] == 1) |
+                      (train_df['sexual_explicit'] == 1)]
+
+nb_0 = len(train_df_0)
+n_sampling = 0.1
+nb_0_new = int(nb_0 * n_sampling)
+print("NB 0:     {}".format(nb_0))
+print("NB 0 new: {}".format(nb_0_new))
+ids_0 = np.random.randint(0, high=nb_0, size=nb_0_new)
+
+train_df_0 = train_df_0.iloc[ids_0]
+train_df = pd.concat([train_df_0, train_df_1])
+
+print("Train size: {}".format(len(train_df)))
+
+# %%
 class JigsawDataset(Dataset):
-    def __init__(self, data_df, tokenizer):
+    def __init__(self, data_df, tokenizer, vocab, max_len=64):
         self.data = data_df
         self.tokenizer = tokenizer
+        self.vocab = vocab
+        self.max_len = max_len
 
     def __len__(self):
         return len(self.data)
@@ -172,145 +226,305 @@ class JigsawDataset(Dataset):
         comment = self.data.iloc[index]["comment_text"]
         label = torch.tensor(self.data.iloc[index][LABEL_LIST].tolist(), dtype=torch.float)
         
-        token_list, attention_mask = self.text_to_token_and_mask(comment)
+        # Tokenize the sentence
+        tokenized_sentence = self.tokenizer(comment)[:self.max_len]
 
-        return dict(index=index, ids=token_list, mask=attention_mask, labels=label)
-    
-    def text_to_token_and_mask(self, input_text):
-        tokenization_dict = tokenizer.encode_plus(input_text,
-                                add_special_tokens=True,
-                                max_length=128,
-                                padding='max_length',
-                                truncation=True,
-                                return_attention_mask=True,
-                                return_tensors='pt')
-        token_list = tokenization_dict["input_ids"].flatten()
-        attention_mask = tokenization_dict["attention_mask"].flatten()
-        return (token_list, attention_mask)
+        # Get ids from tokens
+        ids = torch.tensor([self.vocab[token] for token in tokenized_sentence])
+
+        # Pad the sequence
+        padding = torch.full((self.max_len - len(ids), ), self.vocab['<pad>'])
+        padded_ids = torch.cat([ids, padding])
+
+        return dict(index=index, ids=padded_ids, labels=label)
 
 # %% [markdown]
 # ## Model
 
 # %%
-def set_lr(optim, lr):
-    '''
-    Set the learning rate in the optimizer
-    '''
-    for g in optim.param_groups:
-        g['lr'] = lr
-    return optim
+import torch
+from torch import nn, einsum
+
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
+
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+    def forward(self, x, **kwargs):
+        return self.fn(x, **kwargs) + x
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), **kwargs)
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout = 0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+        super().__init__()
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+    def forward(self, x):
+        b, n, _, h = *x.shape, self.heads
+        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), qkv)
+
+        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+
+        attn = dots.softmax(dim=-1)
+
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out =  self.to_out(out)
+        return out
 
 # %%
-# Transformer class and functions for models and predictions
+# Implementation from:
+# https://github.com/rishikksh20/compact-convolution-transformer/blob/master/cct.py
 
-class TransformerClassifierStack(nn.Module):
-    def __init__(self, tr_model, nb_labels, dropout_prob=0.4, freeze=False):
+import torch
+from torch import nn, einsum
+import numpy as np
+import torch.nn.functional as F
+from einops import rearrange
+from einops.layers.torch import Rearrange
+# from module import Attention, PreNorm, FeedForward
+
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
         super().__init__()
-        self.tr_model = tr_model
-
-        # Stack features of 4 last encoders
-        self.hidden_dim = tr_model.config.hidden_size * 4
-
-        # hidden linear for the classification
-        self.dropout = nn.Dropout(dropout_prob)
-        self.hl = nn.Linear(self.hidden_dim, self.hidden_dim)
-
-        # Last Linear for the classification
-        self.last_l = nn.Linear(self.hidden_dim, nb_labels)
-
-        # freeze all the parameters if necessary
-        for param in self.tr_model.parameters():
-            param.requires_grad = not freeze
-
-        # init learning params of last layers
-        torch.nn.init.xavier_uniform_(self.hl.weight)
-        torch.nn.init.xavier_uniform_(self.last_l.weight)
-
-    def forward(self, ids, mask):
-        # ids = [batch_size, padded_seq_len]
-        # mask = [batch_size, padded_seq_len]
-        # mask: avoid to make self attention on padded data
-        tr_output = self.tr_model(input_ids=ids,
-                                  attention_mask=mask,
-                                  output_hidden_states=True)
-
-        # Get all the hidden states
-        hidden_states = tr_output['hidden_states']
-
-        # hs_* = [batch_size, padded_seq_len, 768]
-        hs_1 = hidden_states[-1][:, 0, :]
-        hs_2 = hidden_states[-2][:, 0, :]
-        hs_3 = hidden_states[-3][:, 0, :]
-        hs_4 = hidden_states[-4][:, 0, :]
-
-        # features_vec = [batch_size, 768 * 4]
-        features_vec = torch.cat([hs_1, hs_2, hs_3, hs_4], dim=-1)
-
-        x = self.dropout(features_vec)
-        x = self.hl(x)
-
-        # x = [batch_size, 768 * 4]
-        x = torch.tanh(x)
-        x = self.dropout(x)
-        x = self.last_l(x)
-        
-        # x = [batch_size, 1]
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
+                PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
+            ]))
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
         return x
 
-def load_roberta_model(nb_labels):
-    '''
-    Load RoBERTa model without any checkpoint
-    RoBERTa for finetuning
-    '''
-    logger.info(f"transformers.RobertaTokenizer : roberta-base")
-    logger.info(f"transformers.AutoModel : roberta-base")
-    tokenizer = transformers.RobertaTokenizer.from_pretrained('roberta-base')
-    tr_model = transformers.AutoModel.from_pretrained('roberta-base')
-    model = TransformerClassifierStack(tr_model, nb_labels, freeze=True)
-    return model, tokenizer
+class ConvEmbed(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size=7, stride=2, padding=3, pool_kernel_size=3, pool_stride=2,
+                 pool_padding=1):
+        super(ConvEmbed, self).__init__()
 
 
-def load_roberta_pretrained(path, nb_labels, lr=2e-5):
-    '''
-    Load RoBERTa from checkout point (already trained on Hate Speech tasks)
-    '''
-    tokenizer = transformers.RobertaTokenizer.from_pretrained('roberta-base')
-    tr_model = transformers.AutoModel.from_pretrained('roberta-base')
-    model = TransformerClassifierStack(tr_model, nb_labels)
 
-    loaded = torch.load(path)
-    model.load_state_dict(loaded['state_dict'])
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(in_channel, out_channel, kernel_size=kernel_size, stride=stride,
+                    padding=padding, bias=False),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=pool_kernel_size, stride=pool_stride, padding=pool_padding),
+            Rearrange('b d h w -> b (h w) d')
+            )
 
-    optimizer = transformers.AdamW(model.parameters(), lr=lr)
-    optimizer.load_state_dict(loaded['optimizer_dict'])
-    optimizer = set_lr(optimizer, lr)
+        self.apply(self.init_weight)
 
-    return model, tokenizer, optimizer
+    def sequence_length(self, n_channels=3, height=224, width=224):
+        return self.forward(torch.zeros((1, n_channels, height, width))).shape[1]
+
+    def forward(self, x):
+        return self.conv_layers(x)
+
+    @staticmethod
+    def init_weight(m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight)
+
+
+class CompactTransformer(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim=768, depth=12, heads=12, pool='cls', in_channels=3,
+                 dim_head=64, dropout=0.1, emb_dropout=0.1, scale_dim=4, conv_embed=False):
+        super().__init__()
+
+        width, height = image_size
+
+        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
+
+        assert width % patch_size == 0, 'Image dimensions (width) must be divisible by the patch size.'
+        assert height % patch_size == 0, 'Image dimensions (height) must be divisible by the patch size.'
+        # num_patches = (image_size // patch_size) ** 2
+        num_patches = (width // patch_size) * (height // patch_size)
+        patch_dim = in_channels * patch_size ** 2
+
+        if conv_embed:
+            self.to_patch_embedding = ConvEmbed(in_channels, dim)
+            num_patches = self.to_patch_embedding.sequence_length(n_channels=in_channels,
+                                                                  height=height,
+                                                                  width=width)
+        else:
+            self.to_patch_embedding = nn.Sequential(
+                Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_size, p2=patch_size),
+                nn.Linear(patch_dim, dim),
+            )
+
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, dim))
+        nn.init.trunc_normal_(self.pos_embedding, std=0.2)
+
+        self.dropout = nn.Dropout(emb_dropout)
+
+        self.transformer = Transformer(dim, depth, heads, dim_head, dim*scale_dim, dropout)
+
+        self.pool = nn.Linear(dim, 1)
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+        self.apply(self.init_weight)
+
+    def forward(self, img):
+        x = self.to_patch_embedding(img)
+        b, n, _ = x.shape
+
+        x += self.pos_embedding[:, :(n + 1)]
+        x = self.dropout(x)
+
+        x = self.transformer(x)
+
+        g = self.pool(x)
+        xl = F.softmax(g, dim=1)
+        x = einsum('b n l, b n d -> b l d', xl, x)
+
+        return self.mlp_head(x.squeeze(-2))
+
+    @staticmethod
+    def init_weight(m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+class CCTClassifier(nn.Module):
+    def __init__(self,
+                 nb_labels: int = 6,
+                 in_channels: int = 3,
+                 pretrained_embedding: str = "glove",
+                 embedding_dim: int = 300,
+                 freeze_embedding: bool = False,
+                 vocab = None,
+                 img_size: tuple = (60,60),
+                 patch_size: int = 16,
+                 cct_dim: int = 768,
+                 cct_depth: int = 12,
+                 cct_heads: int = 12,
+                 cct_dim_head: int = 64,
+                 conv_embed: bool = True):
+        super().__init__()
+
+        vocab_size = len(vocab)
+        pad_index = vocab['<pad>']
+
+        # Embedding type
+        if pretrained_embedding == "glove":
+            self.embedding = nn.Embedding(vocab_size, 300, padding_idx=pad_index)
+
+            # Download pretrained glove embedding
+            vectors = torchtext.vocab.GloVe()
+
+            # Get the pretrained embedding vectors according to the vocabulary
+            pretrained_embedding = vectors.get_vecs_by_tokens(vocab.get_itos())
+            self.embedding.weight.data = pretrained_embedding
+        else:
+            self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_index)
+
+        self.cct = CompactTransformer(img_size,
+                                      patch_size,
+                                      nb_labels,
+                                      in_channels=in_channels,
+                                      dim=cct_dim,
+                                      depth=cct_depth,
+                                      heads=cct_heads,
+                                      dim_head=cct_dim_head,
+                                      conv_embed=conv_embed)
+
+        # freeze all the embedding parameters if necessary
+        for param in self.embedding.parameters():
+            param.requires_grad = not freeze_embedding
+
+    def forward(self, ids):
+        # ids = [batch_size, padded_seq_len]
+        x = self.embedding(ids)
+
+        # x = [batch_size, padded_seq_len, embedding_dim]
+        x = torch.unsqueeze(x, 1)
+
+        # x = [batch_size, 1, padded_seq_len, embedding_dim]
+        x = self.cct(x)
+
+        # x = [batch_size, nb_labels]
+        return x
 
 def preds_fn(batch, model, device):
     '''
     Get the predictions for one batch according to the model
     '''
-    b_input = batch['ids'].to(device)
-    b_mask = batch['mask'].to(device)
+    ids = batch['ids'].int()
+    b_input = ids.to(device, non_blocking=True)
+    return model(b_input)
 
-    return model(b_input, b_mask)
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+# %% [markdown]
+# ### Instancier le modèle
 
 # %%
-# Load the model
-model, tokenizer = load_roberta_model(nb_labels=len(LABEL_LIST))
-logger.success("Model loaded !")
+img_size = 70, 300
+
+model = CCTClassifier(img_size=img_size,
+                     vocab=vocab,
+                     in_channels=1,
+                     pretrained_embedding="glove",
+                     patch_size=10,
+                     freeze_embedding=False,
+                     cct_depth=6,
+                     cct_heads=6)
+
+print(f'The model ("{CUSTOME_NAME}") has {count_parameters(model):,} trainable parameters')
 
 # %% [markdown]
 # ## Hyperparamètre
 
 # %%
-BATCH_SIZE = 32
+BATCH_SIZE = 8
 LR=1e-4
 PIN_MEMORY = True
 NUM_WORKERS = 0
 PREFETCH_FACTOR = 2
-NUM_EPOCHS = 1
+NUM_EPOCHS = 3
 logger.info(f"{BATCH_SIZE=}")
 logger.info(f"{LR=}")
 logger.info(f"{PIN_MEMORY=}")
@@ -638,7 +852,9 @@ def get_nb_samples_lab(df, classes=LABEL_LIST):
 # ### Instancier les différents objets
 
 # %%
-train_dataset = JigsawDataset(train_df, tokenizer)
+train_dataset = JigsawDataset(train_df, tokenizer,
+                              vocab=vocab,
+                              max_len=max_len)
 train_dataloader = DataLoader(train_dataset,
                              batch_size=BATCH_SIZE,
                              shuffle=True,
@@ -646,7 +862,9 @@ train_dataloader = DataLoader(train_dataset,
                              prefetch_factor=PREFETCH_FACTOR,
                              pin_memory=PIN_MEMORY)
 
-validation_dataset = JigsawDataset(validation_df, tokenizer)
+validation_dataset = JigsawDataset(validation_df, tokenizer,
+                              vocab=vocab,
+                              max_len=max_len)
 validation_dataloader = DataLoader(validation_dataset,
                              batch_size=BATCH_SIZE,
                              shuffle=True,
@@ -655,8 +873,8 @@ validation_dataloader = DataLoader(validation_dataset,
                              pin_memory=PIN_MEMORY)
 
 # Pas besoin de Sigmoid en sorti du model seulement pour `BCEWithLogitsLoss`
-pos_weight = get_label_weights_bce(train_df).to(device)
-criterion = FocalLoss(pos_weight=pos_weight)
+pos_weight = get_label_weights_bce(train_df)
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 logger.info(criterion)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 logger.info(optimizer)
@@ -892,19 +1110,15 @@ def train_epoch(epoch_id=None):
 
     progress = tqdm(train_dataloader, desc='training batch...', leave=False)
     for batch_id, batch in enumerate(progress):
-        if batch_id % 1_000 == 0:
-            valid_epoch(epoch_id=epoch, batch_id=batch_id)
-        
         logger.trace(f"{batch_id=}")
         token_list_batch = batch["ids"].to(device)
-        attention_mask_batch = batch["mask"].to(device)
         label_batch = batch["labels"].to(device)
 
         # Reset gradient
         optimizer.zero_grad()
 
         # Predict
-        prediction_batch = model(token_list_batch, attention_mask_batch)
+        prediction_batch = model(token_list_batch)
         transformed_prediction_batch = prediction_batch.squeeze()
 
         # Loss
@@ -945,11 +1159,10 @@ def valid_epoch(epoch_id=None, batch_id=None):
     for _, batch in enumerate(progress):
         
         token_list_batch = batch["ids"].to(device)
-        attention_mask_batch = batch["mask"].to(device)
         label_batch = batch["labels"].to(device)
 
         # Predict
-        prediction_batch = model(token_list_batch, attention_mask_batch)
+        prediction_batch = model(token_list_batch)
 
         transformed_prediction_batch = prediction_batch.squeeze()
 
@@ -983,7 +1196,7 @@ for epoch in progress:
     train_epoch(epoch_id=epoch)
 
     # Validation
-    valid_epoch(epoch_id=epoch)
+    # valid_epoch(epoch_id=epoch)
 
     # Save
     torch.save(model, MODEL_FILE_PATH)
@@ -1002,10 +1215,12 @@ except NameError:
 test_df = pd.read_csv(TEST_DATASET_PATH, index_col=0)
 
 # %%
-test_df = test_df[~test_df.white.isna()]
+# test_df = test_df[~test_df.white.isna()]
 
 # %%
-test_dataset = JigsawDataset(test_df, tokenizer)
+test_dataset = JigsawDataset(test_df, tokenizer,
+                              vocab=vocab,
+                              max_len=max_len)
 test_dataloader = DataLoader(test_dataset,
                              batch_size=BATCH_SIZE,
                              shuffle=False)
@@ -1024,11 +1239,10 @@ def evaluation(model):
         logger.trace(f"{batch_id=}")
         index_batch = batch["index"].to(device)
         token_list_batch = batch["ids"].to(device)
-        attention_mask_batch = batch["mask"].to(device)
         label_batch = batch["labels"].to(device)
 
         # Predict
-        prediction_batch = model(token_list_batch, attention_mask_batch)
+        prediction_batch = model(token_list_batch)
         transformed_prediction_batch = prediction_batch.squeeze()
         proba_prediction_batch = torch.sigmoid(transformed_prediction_batch)
         
@@ -1063,14 +1277,13 @@ def export_validation(model):
         logger.trace(f"{batch_id=}")
         index_batch = batch["index"].to(device)
         token_list_batch = batch["ids"].to(device)
-        attention_mask_batch = batch["mask"].to(device)
         label_batch = batch["labels"].to(device)
 
         # Predict
-        prediction_batch = model(token_list_batch, attention_mask_batch)
+        prediction_batch = model(token_list_batch)
         transformed_prediction_batch = prediction_batch.squeeze()
         proba_prediction_batch = torch.sigmoid(transformed_prediction_batch)
-        
+
         index_tensor = torch.concat([index_tensor, index_batch.cpu()])
         prediction_tensor = torch.concat([prediction_tensor, proba_prediction_batch.cpu()])
         label_tensor = torch.concat([label_tensor, label_batch.cpu()])
@@ -1085,6 +1298,6 @@ def export_validation(model):
     prediction_valid_df.to_csv(VALIDATION_FILE_PATH)
     label_valid_df.to_csv(VALIDATION_DATASET_FILE_PATH)
     logger.success(f"Validation predictions exported !")
-export_validation(model)
+# export_validation(model)
 
 

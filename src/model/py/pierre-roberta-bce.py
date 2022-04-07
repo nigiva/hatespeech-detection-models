@@ -1,5 +1,5 @@
 # %% [markdown]
-# # RoBERTa pwFL
+# # RoBERTa pwBCE
 
 # %% [markdown]
 # ## Variables d'environnement
@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore")
 # ## Constantes
 
 # %%
-CUSTOME_NAME = "roberta-pwfl"
+CUSTOME_NAME = "pierre-roberta-bce"
 
 # Dataset
 DATA_DIR_PATH = os.path.abspath("../../data")
@@ -130,9 +130,6 @@ for gpu_id in range(GPU_COUNT):
     gpu_name = torch.cuda.get_device_name(0)
     logger.info(f"GPU {gpu_id} : {gpu_name}")
 
-
-import os
-os.exit(1)
 # %% [markdown]
 # ## Dataset
 
@@ -143,7 +140,8 @@ logger.success("Dataset loaded !")
 # %%
 # Pour réduire le nombre d'exemple et savoir sur quel groupes d'identités
 # le modèle est entrainé, on prend un sous ensemble du jeu de données
-train_df = all_train_df[~all_train_df.white.isna()]
+# train_df = all_train_df[~all_train_df.white.isna()]
+train_df = all_train_df
 if CUSTOME_NAME.startswith("test"):
     # Si c'est juste une session pour tester le notebook
     logger.debug("Mode test is enabled. The training set has been truncated to 20 000 samples.")
@@ -158,6 +156,36 @@ validation_df = all_train_df[all_train_df.white.isna()].sample(n=10_000)
 # si la probabilité est supérieure ou égale à 0.5 ou non
 train_df[LABEL_LIST] = (train_df[LABEL_LIST]>=0.5).astype(int)
 validation_df[LABEL_LIST] = (validation_df[LABEL_LIST]>=0.5).astype(int)
+
+
+# %%
+# Apply some negative downsampling
+# Maybe change to cleaner implem
+train_df_0 = train_df[(train_df['toxicity'] == 0) &
+                      (train_df['obscene'] == 0) &
+                      (train_df['identity_attack'] == 0) &
+                      (train_df['insult'] == 0) &
+                      (train_df['threat'] == 0) &
+                      (train_df['sexual_explicit'] == 0)]
+
+train_df_1 = train_df[(train_df['toxicity'] == 1) |
+                      (train_df['obscene'] == 1) |
+                      (train_df['identity_attack'] == 1) |
+                      (train_df['insult'] == 1) |
+                      (train_df['threat'] == 1) |
+                      (train_df['sexual_explicit'] == 1)]
+
+nb_0 = len(train_df_0)
+n_sampling = 0.1
+nb_0_new = int(nb_0 * n_sampling)
+print("NB 0:     {}".format(nb_0))
+print("NB 0 new: {}".format(nb_0_new))
+ids_0 = np.random.randint(0, high=nb_0, size=nb_0_new)
+
+train_df_0 = train_df_0.iloc[ids_0]
+train_df = pd.concat([train_df_0, train_df_1])
+
+print("Train size: {}".format(len(train_df)))
 
 # %%
 class JigsawDataset(Dataset):
@@ -266,7 +294,7 @@ def load_roberta_model(nb_labels):
     logger.info(f"transformers.AutoModel : roberta-base")
     tokenizer = transformers.RobertaTokenizer.from_pretrained('roberta-base')
     tr_model = transformers.AutoModel.from_pretrained('roberta-base')
-    model = TransformerClassifierStack(tr_model, nb_labels, freeze=True)
+    model = TransformerClassifierStack(tr_model, nb_labels, freeze=False)
     return model, tokenizer
 
 
@@ -306,11 +334,11 @@ logger.success("Model loaded !")
 
 # %%
 BATCH_SIZE = 32
-LR=1e-4
+LR=1e-5
 PIN_MEMORY = True
 NUM_WORKERS = 0
 PREFETCH_FACTOR = 2
-NUM_EPOCHS = 1
+NUM_EPOCHS = 3
 logger.info(f"{BATCH_SIZE=}")
 logger.info(f"{LR=}")
 logger.info(f"{PIN_MEMORY=}")
@@ -320,33 +348,6 @@ logger.info(f"{NUM_EPOCHS=}")
 
 # %% [markdown]
 # ### Loss
-
-# %%
-class FocalLoss(nn.Module):
-    def __init__(self,
-                 gamma: float = 2,
-                 reduction: str = "mean",
-                 pos_weight: torch.Tensor = None):
-        super(FocalLoss, self).__init__()
-        self.gamma= gamma
-        self.reduction = reduction
-        self.pos_weight = pos_weight
-
-    def forward(self, inputs: torch.Tensor,
-                targets: torch.Tensor):
-        p = torch.sigmoid(inputs)
-        ce_loss = F.binary_cross_entropy_with_logits(
-            inputs, targets, reduction="none", pos_weight=self.pos_weight
-        )
-        p_t =  p * targets + (1 - p) * (1 - targets)
-        loss = ce_loss * ((1 - p_t) ** self.gamma)
-
-        if self.reduction == "mean":
-            loss = loss.mean()
-        elif self.reduction == "sum":
-            loss = loss.sum()
-
-        return loss
 
 # %%
 # Taken from: https://github.com/Roche/BalancedLossNLP
@@ -655,8 +656,8 @@ validation_dataloader = DataLoader(validation_dataset,
                              pin_memory=PIN_MEMORY)
 
 # Pas besoin de Sigmoid en sorti du model seulement pour `BCEWithLogitsLoss`
-pos_weight = get_label_weights_bce(train_df).to(device)
-criterion = FocalLoss(pos_weight=pos_weight)
+# pos_weight = get_label_weights_bce(train_df)
+criterion = torch.nn.BCEWithLogitsLoss()
 logger.info(criterion)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 logger.info(optimizer)
@@ -892,8 +893,9 @@ def train_epoch(epoch_id=None):
 
     progress = tqdm(train_dataloader, desc='training batch...', leave=False)
     for batch_id, batch in enumerate(progress):
-        if batch_id % 1_000 == 0:
-            valid_epoch(epoch_id=epoch, batch_id=batch_id)
+        #if batch_id % 1_000 == 0:
+        #    valid_epoch(epoch_id=epoch, batch_id=batch_id)
+        #    model.train()
         
         logger.trace(f"{batch_id=}")
         token_list_batch = batch["ids"].to(device)
@@ -1002,7 +1004,7 @@ except NameError:
 test_df = pd.read_csv(TEST_DATASET_PATH, index_col=0)
 
 # %%
-test_df = test_df[~test_df.white.isna()]
+# test_df = test_df[~test_df.white.isna()]
 
 # %%
 test_dataset = JigsawDataset(test_df, tokenizer)
@@ -1040,6 +1042,7 @@ def evaluation(model):
                                      columns=LABEL_LIST,
                                      index=index_tensor.to(int).tolist())
     prediction_test_df.to_csv(TEST_FILE_PATH)
+
     logger.success(f"Test predictions exported !")
 
 # %%
@@ -1085,6 +1088,6 @@ def export_validation(model):
     prediction_valid_df.to_csv(VALIDATION_FILE_PATH)
     label_valid_df.to_csv(VALIDATION_DATASET_FILE_PATH)
     logger.success(f"Validation predictions exported !")
-export_validation(model)
+# export_validation(model)
 
 

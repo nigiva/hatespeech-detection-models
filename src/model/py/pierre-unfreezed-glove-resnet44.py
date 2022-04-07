@@ -1,5 +1,5 @@
 # %% [markdown]
-# # RoBERTa pwFL
+# # ResNet44 pwBCE
 
 # %% [markdown]
 # ## Variables d'environnement
@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore")
 # ## Constantes
 
 # %%
-CUSTOME_NAME = "roberta-pwfl"
+CUSTOME_NAME = "pierre-unfreezed-glove-resnet44-pwbce"
 
 # Dataset
 DATA_DIR_PATH = os.path.abspath("../../data")
@@ -73,7 +73,7 @@ os.makedirs(CURRENT_SESSION_DIR_PATH, exist_ok=True)
 
 # Architecture de fichier dans `CURRENT_SESSION_DIR_PATH`
 LOG_FILE_NAME = f"{SESSION_NAME}.loguru.log"
-MODEL_FILE_NAME = f"{SESSION_NAME}.model"
+MODEL_FILE_NAME = f"{SESSION_NAME}.state_dict.model"
 TEST_FILE_NAME = f"{SESSION_NAME}.test.csv"
 VALIDATION_DATASET_NAME = f"{SESSION_NAME}.jigsaw2019-validation.csv"
 VALIDATION_FILE_NAME = f"{SESSION_NAME}.validation.csv"
@@ -130,9 +130,6 @@ for gpu_id in range(GPU_COUNT):
     gpu_name = torch.cuda.get_device_name(0)
     logger.info(f"GPU {gpu_id} : {gpu_name}")
 
-
-import os
-os.exit(1)
 # %% [markdown]
 # ## Dataset
 
@@ -143,7 +140,8 @@ logger.success("Dataset loaded !")
 # %%
 # Pour réduire le nombre d'exemple et savoir sur quel groupes d'identités
 # le modèle est entrainé, on prend un sous ensemble du jeu de données
-train_df = all_train_df[~all_train_df.white.isna()]
+#train_df = all_train_df[~all_train_df.white.isna()]
+train_df = all_train_df
 if CUSTOME_NAME.startswith("test"):
     # Si c'est juste une session pour tester le notebook
     logger.debug("Mode test is enabled. The training set has been truncated to 20 000 samples.")
@@ -160,10 +158,37 @@ train_df[LABEL_LIST] = (train_df[LABEL_LIST]>=0.5).astype(int)
 validation_df[LABEL_LIST] = (validation_df[LABEL_LIST]>=0.5).astype(int)
 
 # %%
+# For GloVe tokenizer and vocabulary
+# Get the tokenizer
+tokenizer = torchtext.data.utils.get_tokenizer('basic_english')
+max_len = 70
+logger.info(f"Tokenizer : basic_english")
+# Build vocab
+min_freq = 5
+logger.info(f"Tokenizer : {min_freq=}")
+special_tokens = ['<unk>', '<pad>']
+logger.info(f"Tokenizer : {special_tokens=}")
+
+# Create tokenized column
+train_df['tokens'] = train_df['comment_text'].apply(lambda x: tokenizer(x)[:max_len])
+logger.info(f"Tokens are stored in column of train_df")
+
+vocab = torchtext.vocab.build_vocab_from_iterator(train_df['tokens'],
+                                                  min_freq=min_freq,
+                                                  specials=special_tokens)
+logger.info(f"Vocab is built")
+
+unk_index = vocab['<unk>']
+pad_index = vocab['<pad>']
+vocab.set_default_index(unk_index)
+
+# %%
 class JigsawDataset(Dataset):
-    def __init__(self, data_df, tokenizer):
+    def __init__(self, data_df, tokenizer, vocab, max_len=64):
         self.data = data_df
         self.tokenizer = tokenizer
+        self.vocab = vocab
+        self.max_len = max_len
 
     def __len__(self):
         return len(self.data)
@@ -172,134 +197,216 @@ class JigsawDataset(Dataset):
         comment = self.data.iloc[index]["comment_text"]
         label = torch.tensor(self.data.iloc[index][LABEL_LIST].tolist(), dtype=torch.float)
         
-        token_list, attention_mask = self.text_to_token_and_mask(comment)
+        # Tokenize the sentence
+        tokenized_sentence = self.tokenizer(comment)[:self.max_len]
 
-        return dict(index=index, ids=token_list, mask=attention_mask, labels=label)
-    
-    def text_to_token_and_mask(self, input_text):
-        tokenization_dict = tokenizer.encode_plus(input_text,
-                                add_special_tokens=True,
-                                max_length=128,
-                                padding='max_length',
-                                truncation=True,
-                                return_attention_mask=True,
-                                return_tensors='pt')
-        token_list = tokenization_dict["input_ids"].flatten()
-        attention_mask = tokenization_dict["attention_mask"].flatten()
-        return (token_list, attention_mask)
+        # Get ids from tokens
+        ids = torch.tensor([self.vocab[token] for token in tokenized_sentence])
+
+        # Pad the sequence
+        padding = torch.full((self.max_len - len(ids), ), self.vocab['<pad>'])
+        padded_ids = torch.cat([ids, padding])
+
+        return dict(index=index, ids=padded_ids, labels=label)
 
 # %% [markdown]
 # ## Model
 
 # %%
-def set_lr(optim, lr):
-    '''
-    Set the learning rate in the optimizer
-    '''
-    for g in optim.param_groups:
-        g['lr'] = lr
-    return optim
+# ResNet implementation from:
+# https://github.com/akamaster/pytorch_resnet_cifar10/blob/master/resnet.py
+# ResNet: resnet20, resnet32, resnet44, resnet56, resnet110, resnet1202
 
-# %%
-# Transformer class and functions for models and predictions
+def _weights_init(m):
+    classname = m.__class__.__name__
+    #print(classname)
+    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight)
 
-class TransformerClassifierStack(nn.Module):
-    def __init__(self, tr_model, nb_labels, dropout_prob=0.4, freeze=False):
-        super().__init__()
-        self.tr_model = tr_model
+class LambdaLayer(nn.Module):
+    def __init__(self, lambd):
+        super(LambdaLayer, self).__init__()
+        self.lambd = lambd
 
-        # Stack features of 4 last encoders
-        self.hidden_dim = tr_model.config.hidden_size * 4
+    def forward(self, x):
+        return self.lambd(x)
 
-        # hidden linear for the classification
-        self.dropout = nn.Dropout(dropout_prob)
-        self.hl = nn.Linear(self.hidden_dim, self.hidden_dim)
+class BasicBlock(nn.Module):
+    expansion = 1
 
-        # Last Linear for the classification
-        self.last_l = nn.Linear(self.hidden_dim, nb_labels)
+    def __init__(self, in_planes, planes, stride=1, option='A'):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
 
-        # freeze all the parameters if necessary
-        for param in self.tr_model.parameters():
-            param.requires_grad = not freeze
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            if option == 'A':
+                """
+                For CIFAR10 ResNet paper uses option A.
+                """
+                self.shortcut = LambdaLayer(lambda x:
+                                            F.pad(x[:, :, ::2, ::2], (0, 0, 0, 0, planes//4, planes//4), "constant", 0))
+            elif option == 'B':
+                self.shortcut = nn.Sequential(
+                     nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                     nn.BatchNorm2d(self.expansion * planes)
+                )
 
-        # init learning params of last layers
-        torch.nn.init.xavier_uniform_(self.hl.weight)
-        torch.nn.init.xavier_uniform_(self.last_l.weight)
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
 
-    def forward(self, ids, mask):
+class ResNet(nn.Module):
+    def __init__(self, block, num_blocks, in_channels=3, num_classes=10):
+        super(ResNet, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        self.linear = nn.Linear(64, num_classes)
+
+        self.apply(_weights_init)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.avg_pool2d(out, kernel_size=(out.size()[2], out.size()[3]))
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+class ResNetClassifier(nn.Module):
+    def __init__(self,
+                 nb_labels: int = 6,
+                 in_channels: int = 3,
+                 pretrained_embedding: str = "glove",
+                 resnet_type: str = "32",
+                 embedding_dim: int = 300,
+                 freeze_embedding: bool = False,
+                 stack_embedding: bool = False,
+                 vocab = None):
+        super().__init__()        
+
+        # If true stack embedding to 3 channels
+        self.stack_embedding = stack_embedding
+
+        if vocab:
+            vocab_size = len(vocab)
+            pad_index = vocab['<pad>']
+
+        # Embedding type
+        if pretrained_embedding == "glove":
+            self.embedding = nn.Embedding(vocab_size, 300, padding_idx=pad_index)
+
+            # Download pretrained glove embedding
+            vectors = torchtext.vocab.GloVe()
+
+            # Get the pretrained embedding vectors according to the vocabulary
+            pretrained_embedding = vectors.get_vecs_by_tokens(vocab.get_itos())
+            self.embedding.weight.data = pretrained_embedding
+
+        elif pretrained_embedding == "fasttext":
+            self.embedding = nn.Embedding(vocab_size, 300, padding_idx=pad_index)
+
+            # Download pretrained FastText embedding
+            vectors = torchtext.vocab.FastText()
+
+            # Get the pretrained embedding vectors according to the vocabulary
+            pretrained_embedding = vectors.get_vecs_by_tokens(vocab.get_itos())
+            self.embedding.weight.data = pretrained_embedding
+
+        elif pretrained_embedding == "roberta":
+            # Download the pretrained Transformer model
+            tr_model = transformers.AutoModel.from_pretrained('roberta-base')
+
+            # set the embedding parameters
+            self.embedding = tr_model.embeddings
+
+        else:
+            self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_index)
+
+        resnet_types_dic = {"20": 0, "32": 1, "44": 2, "56": 3, "110": 4, "1202": 5}
+        resnet_params = [[3, 3, 3], [5, 5, 5], \
+                         [7, 7, 7], [9, 9, 9], \
+                         [18, 18, 18], [200, 200, 200]]
+
+        if resnet_type not in resnet_types_dic:
+            print("Error: 'resnet_type' should be in: ['20', '32', '44', '56', '110', '1202']")
+
+        resnet_param_idx = resnet_types_dic[resnet_type]
+        self.resnet = ResNet(BasicBlock,
+                             resnet_params[resnet_param_idx],
+                             in_channels=in_channels,
+                             num_classes=nb_labels)
+
+        # freeze all the embedding parameters if necessary
+        for param in self.embedding.parameters():
+            param.requires_grad = not freeze_embedding
+
+    def forward(self, ids):
         # ids = [batch_size, padded_seq_len]
-        # mask = [batch_size, padded_seq_len]
-        # mask: avoid to make self attention on padded data
-        tr_output = self.tr_model(input_ids=ids,
-                                  attention_mask=mask,
-                                  output_hidden_states=True)
+        x = self.embedding(ids)
 
-        # Get all the hidden states
-        hidden_states = tr_output['hidden_states']
+        # x = [batch_size, padded_seq_len, embedding_dim]
+        if self.stack_embedding:
+            # Transform the image in 3 channels
+            split = x.shape[-1] // 3
+            x = torch.stack([x[..., 0:split], x[..., split:2*split], x[..., 2*split:]], dim=1)
+            # x = [batch_size, 3, padded_seq_len, embedding_dim]
+        else:
+            x = torch.unsqueeze(x, 1)
+            # x = [batch_size, 1, padded_seq_len, embedding_dim]
 
-        # hs_* = [batch_size, padded_seq_len, 768]
-        hs_1 = hidden_states[-1][:, 0, :]
-        hs_2 = hidden_states[-2][:, 0, :]
-        hs_3 = hidden_states[-3][:, 0, :]
-        hs_4 = hidden_states[-4][:, 0, :]
+        x = self.resnet(x)
 
-        # features_vec = [batch_size, 768 * 4]
-        features_vec = torch.cat([hs_1, hs_2, hs_3, hs_4], dim=-1)
-
-        x = self.dropout(features_vec)
-        x = self.hl(x)
-
-        # x = [batch_size, 768 * 4]
-        x = torch.tanh(x)
-        x = self.dropout(x)
-        x = self.last_l(x)
-        
-        # x = [batch_size, 1]
+        # x = [batch_size, nb_labels]
         return x
-
-def load_roberta_model(nb_labels):
-    '''
-    Load RoBERTa model without any checkpoint
-    RoBERTa for finetuning
-    '''
-    logger.info(f"transformers.RobertaTokenizer : roberta-base")
-    logger.info(f"transformers.AutoModel : roberta-base")
-    tokenizer = transformers.RobertaTokenizer.from_pretrained('roberta-base')
-    tr_model = transformers.AutoModel.from_pretrained('roberta-base')
-    model = TransformerClassifierStack(tr_model, nb_labels, freeze=True)
-    return model, tokenizer
-
-
-def load_roberta_pretrained(path, nb_labels, lr=2e-5):
-    '''
-    Load RoBERTa from checkout point (already trained on Hate Speech tasks)
-    '''
-    tokenizer = transformers.RobertaTokenizer.from_pretrained('roberta-base')
-    tr_model = transformers.AutoModel.from_pretrained('roberta-base')
-    model = TransformerClassifierStack(tr_model, nb_labels)
-
-    loaded = torch.load(path)
-    model.load_state_dict(loaded['state_dict'])
-
-    optimizer = transformers.AdamW(model.parameters(), lr=lr)
-    optimizer.load_state_dict(loaded['optimizer_dict'])
-    optimizer = set_lr(optimizer, lr)
-
-    return model, tokenizer, optimizer
 
 def preds_fn(batch, model, device):
     '''
     Get the predictions for one batch according to the model
     '''
-    b_input = batch['ids'].to(device)
-    b_mask = batch['mask'].to(device)
+    ids = batch['ids'].int()
+    b_input = ids.to(device, non_blocking=True)
+    return model(b_input)
 
-    return model(b_input, b_mask)
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+# %% [markdown]
+# ### Instancier le modèle
 
 # %%
-# Load the model
-model, tokenizer = load_roberta_model(nb_labels=len(LABEL_LIST))
-logger.success("Model loaded !")
+model = ResNetClassifier(nb_labels=len(LABEL_LIST),
+                         in_channels=1,
+                         pretrained_embedding="glove",
+                         resnet_type="44",
+                         freeze_embedding=False,
+                         stack_embedding=False,
+                         vocab=vocab)
+
+
+print(f'The model ("{CUSTOME_NAME}") has {count_parameters(model):,} trainable parameters')
 
 # %% [markdown]
 # ## Hyperparamètre
@@ -310,7 +417,7 @@ LR=1e-4
 PIN_MEMORY = True
 NUM_WORKERS = 0
 PREFETCH_FACTOR = 2
-NUM_EPOCHS = 1
+NUM_EPOCHS = 5
 logger.info(f"{BATCH_SIZE=}")
 logger.info(f"{LR=}")
 logger.info(f"{PIN_MEMORY=}")
@@ -638,7 +745,9 @@ def get_nb_samples_lab(df, classes=LABEL_LIST):
 # ### Instancier les différents objets
 
 # %%
-train_dataset = JigsawDataset(train_df, tokenizer)
+train_dataset = JigsawDataset(train_df, tokenizer,
+                              vocab=vocab,
+                              max_len=max_len)
 train_dataloader = DataLoader(train_dataset,
                              batch_size=BATCH_SIZE,
                              shuffle=True,
@@ -646,7 +755,9 @@ train_dataloader = DataLoader(train_dataset,
                              prefetch_factor=PREFETCH_FACTOR,
                              pin_memory=PIN_MEMORY)
 
-validation_dataset = JigsawDataset(validation_df, tokenizer)
+validation_dataset = JigsawDataset(validation_df, tokenizer,
+                              vocab=vocab,
+                              max_len=max_len)
 validation_dataloader = DataLoader(validation_dataset,
                              batch_size=BATCH_SIZE,
                              shuffle=True,
@@ -655,8 +766,8 @@ validation_dataloader = DataLoader(validation_dataset,
                              pin_memory=PIN_MEMORY)
 
 # Pas besoin de Sigmoid en sorti du model seulement pour `BCEWithLogitsLoss`
-pos_weight = get_label_weights_bce(train_df).to(device)
-criterion = FocalLoss(pos_weight=pos_weight)
+pos_weight = get_label_weights_bce(train_df)
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 logger.info(criterion)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 logger.info(optimizer)
@@ -892,19 +1003,18 @@ def train_epoch(epoch_id=None):
 
     progress = tqdm(train_dataloader, desc='training batch...', leave=False)
     for batch_id, batch in enumerate(progress):
-        if batch_id % 1_000 == 0:
-            valid_epoch(epoch_id=epoch, batch_id=batch_id)
+#        if batch_id % 1_000 == 0:
+#            valid_epoch(epoch_id=epoch, batch_id=batch_id)
         
         logger.trace(f"{batch_id=}")
         token_list_batch = batch["ids"].to(device)
-        attention_mask_batch = batch["mask"].to(device)
         label_batch = batch["labels"].to(device)
 
         # Reset gradient
         optimizer.zero_grad()
 
         # Predict
-        prediction_batch = model(token_list_batch, attention_mask_batch)
+        prediction_batch = model(token_list_batch)
         transformed_prediction_batch = prediction_batch.squeeze()
 
         # Loss
@@ -945,11 +1055,10 @@ def valid_epoch(epoch_id=None, batch_id=None):
     for _, batch in enumerate(progress):
         
         token_list_batch = batch["ids"].to(device)
-        attention_mask_batch = batch["mask"].to(device)
         label_batch = batch["labels"].to(device)
 
         # Predict
-        prediction_batch = model(token_list_batch, attention_mask_batch)
+        prediction_batch = model(token_list_batch)
 
         transformed_prediction_batch = prediction_batch.squeeze()
 
@@ -986,7 +1095,8 @@ for epoch in progress:
     valid_epoch(epoch_id=epoch)
 
     # Save
-    torch.save(model, MODEL_FILE_PATH)
+    # torch.save(model, MODEL_FILE_PATH)
+    torch.save(model.state_dict(), MODEL_FILE_PATH)
 
 # %% [markdown]
 # ## Evaluation
@@ -1002,10 +1112,12 @@ except NameError:
 test_df = pd.read_csv(TEST_DATASET_PATH, index_col=0)
 
 # %%
-test_df = test_df[~test_df.white.isna()]
+# test_df = test_df[~test_df.white.isna()]
 
 # %%
-test_dataset = JigsawDataset(test_df, tokenizer)
+test_dataset = JigsawDataset(test_df, tokenizer,
+                              vocab=vocab,
+                              max_len=max_len)
 test_dataloader = DataLoader(test_dataset,
                              batch_size=BATCH_SIZE,
                              shuffle=False)
@@ -1024,11 +1136,10 @@ def evaluation(model):
         logger.trace(f"{batch_id=}")
         index_batch = batch["index"].to(device)
         token_list_batch = batch["ids"].to(device)
-        attention_mask_batch = batch["mask"].to(device)
         label_batch = batch["labels"].to(device)
 
         # Predict
-        prediction_batch = model(token_list_batch, attention_mask_batch)
+        prediction_batch = model(token_list_batch)
         transformed_prediction_batch = prediction_batch.squeeze()
         proba_prediction_batch = torch.sigmoid(transformed_prediction_batch)
         
@@ -1063,11 +1174,10 @@ def export_validation(model):
         logger.trace(f"{batch_id=}")
         index_batch = batch["index"].to(device)
         token_list_batch = batch["ids"].to(device)
-        attention_mask_batch = batch["mask"].to(device)
         label_batch = batch["labels"].to(device)
 
         # Predict
-        prediction_batch = model(token_list_batch, attention_mask_batch)
+        prediction_batch = model(token_list_batch)
         transformed_prediction_batch = prediction_batch.squeeze()
         proba_prediction_batch = torch.sigmoid(transformed_prediction_batch)
         
@@ -1085,6 +1195,6 @@ def export_validation(model):
     prediction_valid_df.to_csv(VALIDATION_FILE_PATH)
     label_valid_df.to_csv(VALIDATION_DATASET_FILE_PATH)
     logger.success(f"Validation predictions exported !")
-export_validation(model)
+# export_validation(model)
 
 
