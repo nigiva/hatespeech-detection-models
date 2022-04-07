@@ -5,6 +5,7 @@
 *.pdf
 *.docx
 *.h5
+*.out
 data/
 session/
 .vector_cache/
