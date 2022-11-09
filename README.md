@@ -33,9 +33,9 @@ Then, you just have to :
 
 | Name             | Email (@epita.fr)         | Github account |
 | ---------------- | ------------------------- | -------------- |
-| Corentin Duchêne | corentin.duchene          | `Nigiva`       |
-| Henri Jamet      | henri.jamet               | `hjamet`       |
-| Pierre Guillaume | pierre.guillaume          | `drguigui1`    |
+| Corentin Duchêne | corentin.duchene          | [`Nigiva`](https://github.com/Nigiva) |
+| Henri Jamet      | henri.jamet               | [`hjamet`](https://github.com/hjamet) |
+| Pierre Guillaume | pierre.guillaume          | [`drguigui1`](https://github.com/drguigui1) |
 | Réda Dehak       | reda.dehak                |                |
 
 
