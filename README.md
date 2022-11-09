@@ -18,7 +18,7 @@ Then, you just have to :
 * Run `poetry install` in the project folder
 * Run `poetry shell` to enable the Python virtual environment.
 
-### B.2) Méthode alternative
+### B.2) Alternative method
 In case you don't have `pyenv` and `poetry`, you must :
 * have **Python 3.8.9** installed on your machine
 * `virtualenv` on your Python 3.8.9 (for example via `pip`)
