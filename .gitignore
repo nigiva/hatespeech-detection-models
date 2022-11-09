@@ -5,9 +5,14 @@
 *.pdf
 *.docx
 *.h5
+
+*.svg
+*.pdf
 *.out
+
 data/
 session/
+export/
 .vector_cache/
 credentials
 credentials_seg
