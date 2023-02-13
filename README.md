@@ -38,7 +38,20 @@ Then, you just have to :
 | Pierre Guillaume | pierre.guillaume          | [`drguigui1`](https://github.com/drguigui1) |
 | Réda Dehak       | reda.dehak                |                |
 
+## D) Citation
+In EGC 2023, vol. RNTI-E-39, pp.19-30.
 
-## D) License
+```
+@article{RNTI/papers/1002807,
+  author    = {Corentin Duchêne and Henri Jamet and Pierre Guillaume and Réda Dehak},
+  title     = {Benchmark pour la classification de commentaires toxiques sur le jeu de données Civil Comments},
+  journal = {Revue des Nouvelles Technologies de l'Information},
+  volume = {Extraction et Gestion des Connaissances, RNTI-E-39},
+  year      = {2023},
+  pages     = {19-30}
+}
+```
+
+## E) License
 
 [**MIT license**](opensource.org/licenses/mit-license.php)
